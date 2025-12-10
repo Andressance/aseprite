@@ -25,7 +25,21 @@
 #include <fstream>
 #include <sstream>
 
-#define GEMINI_KEY "AIzaSyBxR8FS6dYJgVRSlGfrEs4EbKrsysYvjyw"
+#include <cstdlib>
+
+std::string get_gemini_key() {
+  if (const char* env_p = std::getenv("GEMINI_API_KEY")) {
+    return std::string(env_p);
+  }
+  std::ifstream env_file(".env");
+  std::string line;
+  while (std::getline(env_file, line)) {
+    if (line.find("GEMINI_API_KEY=") == 0) {
+      return line.substr(15);
+    }
+  }
+  return "";
+}
 
 namespace app {
 
@@ -248,7 +262,14 @@ private:
     
     std::string bodyFunc = reqBody.dump();
     
-    net::HttpRequest req("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" GEMINI_KEY);
+    std::string apiKey = get_gemini_key();
+    if (apiKey.empty()) {
+        m_error = "API Key not found in .env or environment";
+        m_done = true;
+        return;
+    }
+    
+    net::HttpRequest req("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey);
     req.setBody(bodyFunc);
     
     net::HttpHeaders headers;

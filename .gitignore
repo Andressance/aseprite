@@ -19,3 +19,4 @@ build
 .deps
 CMakeSettings.json
 aseprite-release/
+.env
