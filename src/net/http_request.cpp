@@ -56,6 +56,13 @@ public:
     }
 
     curl_easy_setopt(m_curl, CURLOPT_HTTPHEADER, m_headerlist);
+    curl_easy_setopt(m_curl, CURLOPT_HTTPHEADER, m_headerlist);
+  }
+
+  void setBody(const std::string& body)
+  {
+    curl_easy_setopt(m_curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(m_curl, CURLOPT_COPYPOSTFIELDS, body.c_str());
   }
 
   bool send(HttpResponse& response)
@@ -111,6 +118,11 @@ HttpRequest::~HttpRequest()
 void HttpRequest::setHeaders(const HttpHeaders& headers)
 {
   m_impl->setHeaders(headers);
+}
+
+void HttpRequest::setBody(const std::string& body)
+{
+  m_impl->setBody(body);
 }
 
 bool HttpRequest::send(HttpResponse& response)

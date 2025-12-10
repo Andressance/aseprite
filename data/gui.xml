@@ -759,6 +759,7 @@
         <separator />
         <item command="Fill" text="@.edit_fill" />
         <item command="Stroke" text="@.edit_stroke" group="edit_fill" />
+        <item command="GeminiAutopaint" text="Gemini Autopaint..." />
         <separator />
         <menu text="@.edit_rotate">
           <item command="Rotate" text="@.edit_rotate_180">

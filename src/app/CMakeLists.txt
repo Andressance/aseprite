@@ -409,6 +409,7 @@ target_sources(app-lib PRIVATE
   commands/cmd_frame_tag_properties.cpp
   commands/cmd_fullscreen_mode.cpp
   commands/cmd_fullscreen_preview.cpp
+  commands/cmd_gemini_autopaint.cpp
   commands/cmd_goto_frame.cpp
   commands/cmd_goto_layer.cpp
   commands/cmd_goto_tab.cpp

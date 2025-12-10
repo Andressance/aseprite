@@ -24,6 +24,7 @@ public:
   ~HttpRequest();
 
   void setHeaders(const HttpHeaders& headers);
+  void setBody(const std::string& body);
   bool send(HttpResponse& response);
   void abort();
 
