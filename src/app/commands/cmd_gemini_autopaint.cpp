@@ -28,19 +28,32 @@
 #include <cstdlib>
 #include <future>
 
-std::string get_gemini_key() {
-  if (const char* env_p = std::getenv("GEMINI_API_KEY")) {
+enum class LLMProvider {
+  Gemini,
+  Groq,
+  OpenRouter
+};
+
+std::string get_api_key(const std::string& key_name) {
+  // Try environment variable first
+  if (const char* env_p = std::getenv(key_name.c_str())) {
     return std::string(env_p);
   }
+  // Try .env file
   std::ifstream env_file(".env");
   std::string line;
+  std::string search = key_name + "=";
   while (std::getline(env_file, line)) {
-    if (line.find("GEMINI_API_KEY=") == 0) {
-      return line.substr(15);
+    if (line.find(search) == 0) {
+      return line.substr(search.length());
     }
   }
   return "";
 }
+
+std::string get_gemini_key() { return get_api_key("GEMINI_API_KEY"); }
+std::string get_groq_key() { return get_api_key("GROQ_API_KEY"); }
+std::string get_openrouter_key() { return get_api_key("OPENROUTER_API_KEY"); }
 
 namespace app {
 
@@ -175,6 +188,7 @@ private:
   std::atomic<bool> m_abort{false};
   std::string m_response;
   std::string m_error;
+  std::string m_usedProvider;
   
   ui::Label* m_statusLabel = nullptr;
   Label* m_previewLabel = nullptr;
@@ -271,7 +285,7 @@ private:
     Doc* doc = m_context->activeDocument();
     if (!doc || !doc->sprite()) return "{}";
     
-    doc::Palette* palette = doc->sprite()->palette(doc->sprite()->frame(0));
+    doc::Palette* palette = doc->sprite()->palette(frame_t(0));
     ss << "{";
     for (int i = 0; i < palette->size() && i < 16; i++) {
         doc::color_t c = palette->getEntry(i);
@@ -279,14 +293,113 @@ private:
         int g = doc::rgba_getg(c);
         int b = doc::rgba_getb(c);
         int a = doc::rgba_geta(c);
+        // Force opaque colors for AI (avoid transparent index 0)
+        if (a == 0) a = 255;
         ss << "[" << i << "]=Color{r=" << r << ",g=" << g << ",b=" << b << ",a=" << a << "},";
     }
     ss << "}";
     return ss.str();
   }
+  
+  // Build request for specific provider
+  bool tryProvider(LLMProvider provider, const std::string& systemPrompt, const std::string& imgBase64, std::string& outResponse, std::string& outError) {
+    if (m_abort) return false;
+    
+    std::string apiKey;
+    std::string url;
+    std::string bodyJson;
+    
+    switch (provider) {
+      case LLMProvider::Gemini: {
+        apiKey = get_gemini_key();
+        if (apiKey.empty()) return false;
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=" + apiKey;
+        json11::Json reqBody = json11::Json::object {
+          { "contents", json11::Json::array {
+            json11::Json::object {
+              { "parts", json11::Json::array {
+                 json11::Json::object { { "text", systemPrompt } },
+                 json11::Json::object { { "inline_data", json11::Json::object { { "mime_type", "image/png" }, { "data", imgBase64 } } } }
+              }}
+            }
+          }}
+        };
+        bodyJson = reqBody.dump();
+        break;
+      }
+      
+      case LLMProvider::Groq: {
+        apiKey = get_groq_key();
+        if (apiKey.empty()) return false;
+        url = "https://api.groq.com/openai/v1/chat/completions";
+        // Groq uses OpenAI-compatible format but doesn't support images in free tier
+        // Send text-only request
+        json11::Json reqBody = json11::Json::object {
+          { "model", "llama-3.3-70b-versatile" },
+          { "messages", json11::Json::array {
+            json11::Json::object { { "role", "user" }, { "content", systemPrompt + "\n\nNote: Image context not available, generate based on description." } }
+          }},
+          { "temperature", 0.7 },
+          { "max_tokens", 2048 }
+        };
+        bodyJson = reqBody.dump();
+        break;
+      }
+      
+      case LLMProvider::OpenRouter: {
+        apiKey = get_openrouter_key();
+        if (apiKey.empty()) return false;
+        url = "https://openrouter.ai/api/v1/chat/completions";
+        // OpenRouter uses OpenAI-compatible format
+        json11::Json reqBody = json11::Json::object {
+          { "model", "meta-llama/llama-3.2-3b-instruct:free" },  // Free model
+          { "messages", json11::Json::array {
+            json11::Json::object { { "role", "user" }, { "content", systemPrompt } }
+          }}
+        };
+        bodyJson = reqBody.dump();
+        break;
+      }
+    }
+    
+    if (m_abort) return false;
+    
+    net::HttpRequest req(url);
+    req.setBody(bodyJson);
+    
+    net::HttpHeaders headers;
+    headers.setHeader("Content-Type", "application/json");
+    if (provider == LLMProvider::Groq || provider == LLMProvider::OpenRouter) {
+      headers.setHeader("Authorization", "Bearer " + apiKey);
+    }
+    req.setHeaders(headers);
+    
+    std::stringstream ss;
+    net::HttpResponse resp(&ss);
+    
+    if (m_abort) return false;
+    
+    if (req.send(resp)) {
+      if (!m_abort) {
+        outResponse = ss.str();
+        // Check for quota/overload errors in response
+        if (outResponse.find("overloaded") != std::string::npos ||
+            outResponse.find("quota") != std::string::npos ||
+            outResponse.find("rate limit") != std::string::npos) {
+          outError = "Provider quota/overload error";
+          return false;
+        }
+        return true;
+      }
+    } else {
+       if (!m_abort) outError = "Network Error";
+    }
+    
+    return false;
+  }
 
   void processRequestWorker(std::string userPrompt, std::string imgBase64) {
-    if (m_abort) return;  // Check abort flag
+    if (m_abort) return;
     
     int w = 0, h = 0;
     if (m_context && m_context->activeDocument() && m_context->activeDocument()->sprite()) {
@@ -298,7 +411,7 @@ private:
     // Generate palette table
     std::string paletteTable = generatePaletteTable();
 
-    // Build optimized prompt with hex grid support
+    // Build optimized prompt
     std::string systemPrompt = "Context: You are Aseprite Assistant. Use Lua to script Aseprite.\n\n" + sizeHint + "\n\n"
         "CRITICAL LAYER SAFETY: Always start by creating a new layer:\n"
         "```lua\n"
@@ -328,45 +441,31 @@ private:
         "- NO stray pixels or noise\n\n"
         "ALWAYS end with `app.refresh()`\n\n"
         "User Request: " + userPrompt + "\n\nOutput MUST be a complete Lua code block in markdown format.";
-
-    json11::Json reqBody = json11::Json::object {
-      { "contents", json11::Json::array {
-        json11::Json::object {
-          { "parts", json11::Json::array {
-             json11::Json::object { { "text", systemPrompt } },
-             json11::Json::object { { "inline_data", json11::Json::object { { "mime_type", "image/png" }, { "data", imgBase64 } } } }
-          }}
-        }
-      }}
-    };
     
-    if (m_abort) return;  // Check abort flag before API call
+    // Try providers in fallback order
+    std::vector<LLMProvider> providers = { LLMProvider::Gemini, LLMProvider::Groq, LLMProvider::OpenRouter };
+    std::vector<std::string> providerNames = { "Gemini", "Groq (Llama 3.3)", "OpenRouter (Llama 3.2)" };
     
-    std::string bodyFunc = reqBody.dump();
+    bool success = false;
+    std::string lastError;
     
-    std::string apiKey = get_gemini_key();
-    if (apiKey.empty()) {
-        m_error = "API Key not found in .env or environment";
-        m_done = true;
-        return;
+    for (size_t i = 0; i < providers.size(); i++) {
+      if (m_abort) return;
+      
+      std::string providerError;
+      if (tryProvider(providers[i], systemPrompt, imgBase64, m_response, providerError)) {
+        // Success! Store which provider was used
+        m_usedProvider = providerNames[i];
+        success = true;
+        break;
+      }
+      
+      // Failed, try next provider
+      lastError = providerError;
     }
     
-    net::HttpRequest req("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey);
-    req.setBody(bodyFunc);
-    
-    net::HttpHeaders headers;
-    headers.setHeader("Content-Type", "application/json");
-    req.setHeaders(headers);
-    
-    std::stringstream ss;
-    net::HttpResponse resp(&ss);
-    
-    if (m_abort) return;  // Check abort flag
-    
-    if (req.send(resp)) {
-       if (!m_abort) m_response = ss.str();
-    } else {
-       if (!m_abort) m_error = "Network Error";
+    if (!success && !m_abort) {
+      m_error = "All providers failed. Last error: " + lastError;
     }
     
     if (!m_abort) m_done = true;
@@ -385,12 +484,20 @@ private:
            return;
        }
        
-       if (json["candidates"].array_items().empty()) {
-           if(m_statusLabel) m_statusLabel->setText("System: No candidates.");
+       std::string text;
+       
+       // Try Gemini format first
+       if (!json["candidates"].array_items().empty()) {
+           text = json["candidates"][0]["content"]["parts"][0]["text"].string_value();
+       }
+       // Try OpenAI-compatible format (Groq, OpenRouter)
+       else if (!json["choices"].array_items().empty()) {
+           text = json["choices"][0]["message"]["content"].string_value();
+       }
+       else {
+           if(m_statusLabel) m_statusLabel->setText("System: No response content found.");
            return;
        }
-       
-       std::string text = json["candidates"][0]["content"]["parts"][0]["text"].string_value();
        
        // Lua Extraction
         std::string luaCode;
@@ -413,7 +520,8 @@ private:
         }
         
         if (!luaCode.empty()) {
-           if(m_statusLabel) m_statusLabel->setText("System: Executing script...");
+           std::string providerInfo = m_usedProvider.empty() ? "" : " (via " + m_usedProvider + ")";
+           if(m_statusLabel) m_statusLabel->setText("System: Executing script..." + providerInfo);
            
            // Inject palette helper
            std::string paletteTable = generatePaletteTable();
@@ -440,10 +548,10 @@ private:
            
            app::script::Engine engine;
            engine.evalCode(helperCode + luaCode);
-           if(m_statusLabel) m_statusLabel->setText("System: Done.");
+           if(m_statusLabel) m_statusLabel->setText("System: Done!" + providerInfo);
         } else {
            if(m_statusLabel) m_statusLabel->setText("System: No code found.");
-           addMessage("Gemini", text.substr(0, 100) + "..."); // Preview
+           addMessage("AI", text.substr(0, 100) + "..."); // Preview
         }
   }
 };

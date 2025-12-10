@@ -20,3 +20,5 @@ build
 CMakeSettings.json
 aseprite-release/
 .env
+gemini_temp.png
+gemini_temp*
