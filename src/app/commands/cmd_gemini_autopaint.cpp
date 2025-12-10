@@ -332,12 +332,18 @@ private:
         apiKey = get_groq_key();
         if (apiKey.empty()) return false;
         url = "https://api.groq.com/openai/v1/chat/completions";
-        // Groq uses OpenAI-compatible format but doesn't support images in free tier
-        // Send text-only request
+        // Groq uses OpenAI-compatible format
         json11::Json reqBody = json11::Json::object {
           { "model", "llama-3.3-70b-versatile" },
           { "messages", json11::Json::array {
-            json11::Json::object { { "role", "user" }, { "content", systemPrompt + "\n\nNote: Image context not available, generate based on description." } }
+            json11::Json::object { 
+              { "role", "system" }, 
+              { "content", "You are an Aseprite Lua script generator. Generate ONLY valid Lua code in markdown code blocks. Follow all instructions precisely." } 
+            },
+            json11::Json::object { 
+              { "role", "user" }, 
+              { "content", systemPrompt + "\n\nNote: Image context not available, generate based on text description only." } 
+            }
           }},
           { "temperature", 0.7 },
           { "max_tokens", 2048 }
@@ -352,9 +358,16 @@ private:
         url = "https://openrouter.ai/api/v1/chat/completions";
         // OpenRouter uses OpenAI-compatible format
         json11::Json reqBody = json11::Json::object {
-          { "model", "meta-llama/llama-3.2-3b-instruct:free" },  // Free model
+          { "model", "meta-llama/llama-3.2-3b-instruct:free" },
           { "messages", json11::Json::array {
-            json11::Json::object { { "role", "user" }, { "content", systemPrompt } }
+            json11::Json::object { 
+              { "role", "system" }, 
+              { "content", "You are an Aseprite Lua script generator. Generate ONLY valid Lua code in markdown code blocks. Follow all instructions precisely." } 
+            },
+            json11::Json::object { 
+              { "role", "user" }, 
+              { "content", systemPrompt + "\n\nNote: Image context not available, generate based on text description only." } 
+            }
           }}
         };
         bodyJson = reqBody.dump();
