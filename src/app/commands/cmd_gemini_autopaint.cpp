@@ -13,6 +13,8 @@
 #include "app/file/file.h"
 #include "doc/sprite.h"
 #include "doc/image.h"
+#include "doc/mask.h"
+#include "gfx/rect.h"
 #include "net/http_request.h"
 #include "net/http_response.h"
 #include "net/http_headers.h"
@@ -34,12 +36,23 @@ enum class LLMProvider {
   OpenRouter
 };
 
+// Simple in-memory storage for API keys (could be upgraded to Aseprite preferences)
+static std::string s_gemini_key;
+static std::string s_groq_key;
+static std::string s_openrouter_key;
+
 std::string get_api_key(const std::string& key_name) {
-  // Try environment variable first
+  // Try in-memory first
+  if (key_name == "GEMINI_API_KEY" && !s_gemini_key.empty()) return s_gemini_key;
+  if (key_name == "GROQ_API_KEY" && !s_groq_key.empty()) return s_groq_key;
+  if (key_name == "OPENROUTER_API_KEY" && !s_openrouter_key.empty()) return s_openrouter_key;
+  
+  // Fallback to environment variable
   if (const char* env_p = std::getenv(key_name.c_str())) {
     return std::string(env_p);
   }
-  // Try .env file
+  
+  // Fallback to .env file
   std::ifstream env_file(".env");
   std::string line;
   std::string search = key_name + "=";
@@ -49,6 +62,12 @@ std::string get_api_key(const std::string& key_name) {
     }
   }
   return "";
+}
+
+void set_api_key(const std::string& key_name, const std::string& value) {
+  if (key_name == "GEMINI_API_KEY") s_gemini_key = value;
+  else if (key_name == "GROQ_API_KEY") s_groq_key = value;
+  else if (key_name == "OPENROUTER_API_KEY") s_openrouter_key = value;
 }
 
 std::string get_gemini_key() { return get_api_key("GEMINI_API_KEY"); }
@@ -142,15 +161,18 @@ public:
     m_input = new Entry(1024, "");
     m_input->setExpansive(true);
     m_send = new Button("Send");
+    m_configButton = new Button("Config");
     
     inputBox->addChild(m_input);
     inputBox->addChild(m_send);
+    inputBox->addChild(m_configButton);
     mainBox->addChild(inputBox);
 
     addChild(mainBox);
 
     // Events
     m_send->Click.connect([this]{ onSend(); });
+    m_configButton->Click.connect([this]{ showConfigDialog(); });
     
     // Timer
     m_timer = new ui::Timer(100, this);
@@ -181,6 +203,7 @@ private:
   Box* m_historyBox;
   Entry* m_input;
   Button* m_send;
+  Button* m_configButton;
   ui::Timer* m_timer;
   
   std::thread m_worker;
@@ -190,8 +213,66 @@ private:
   std::string m_error;
   std::string m_usedProvider;
   
+  int m_selX = -1;
+  int m_selY = -1;
+  int m_selW = 999999;
+  int m_selH = 999999;
+  
   ui::Label* m_statusLabel = nullptr;
   Label* m_previewLabel = nullptr;
+
+
+  void showConfigDialog() {
+    Window* configWin = new Window(Window::WithTitleBar, "API Key Configuration");
+    Box* mainBox = new Box(VERTICAL);
+    
+    // Gemini Key
+    Box* geminiBox = new Box(HORIZONTAL);
+    geminiBox->addChild(new Label("Gemini API Key:"));
+    Entry* geminiEntry = new Entry(512, get_gemini_key().c_str());
+    geminiEntry->setExpansive(true);
+    geminiBox->addChild(geminiEntry);
+    mainBox->addChild(geminiBox);
+    
+    // Groq Key  
+    Box* groqBox = new Box(HORIZONTAL);
+    groqBox->addChild(new Label("Groq API Key:"));
+    Entry* groqEntry = new Entry(512, get_groq_key().c_str());
+    groqEntry->setExpansive(true);
+    groqBox->addChild(groqEntry);
+    mainBox->addChild(groqBox);
+    
+    // OpenRouter Key
+    Box* orBox = new Box(HORIZONTAL);
+    orBox->addChild(new Label("OpenRouter API Key:"));
+    Entry* orEntry = new Entry(512, get_openrouter_key().c_str());
+    orEntry->setExpansive(true);
+    orBox->addChild(orEntry);
+    mainBox->addChild(orBox);
+    
+    // Buttons
+    Box* btnBox = new Box(HORIZONTAL);
+    Button* saveBtn = new Button("Save");
+    Button* cancelBtn = new Button("Cancel");
+    btnBox->addChild(saveBtn);
+    btnBox->addChild(cancelBtn);
+    mainBox->addChild(btnBox);
+    
+    configWin->addChild(mainBox);
+    
+    saveBtn->Click.connect([=]() {
+      set_api_key("GEMINI_API_KEY", geminiEntry->text());
+      set_api_key("GROQ_API_KEY", groqEntry->text());
+      set_api_key("OPENROUTER_API_KEY", orEntry->text());
+      configWin->closeWindow(nullptr);
+    });
+    
+    cancelBtn->Click.connect([=]() {
+      configWin->closeWindow(nullptr);
+    });
+    
+    configWin->openWindowInForeground();
+  }
 
   ui::Label* addMessage(const std::string& role, const std::string& text) {
       ui::Box* row = new ui::Box(HORIZONTAL);
@@ -415,22 +496,51 @@ private:
     if (m_abort) return;
     
     int w = 0, h = 0;
+    int selX = 0, selY = 0, selW = 0, selH = 0;
+    bool hasSelection = false;
+    
     if (m_context && m_context->activeDocument() && m_context->activeDocument()->sprite()) {
         w = m_context->activeDocument()->sprite()->width();
         h = m_context->activeDocument()->sprite()->height();
+        
+        // Detect active selection
+        Doc* doc = m_context->activeDocument();
+        if (doc->isMaskVisible()) {
+            gfx::Rect bounds = doc->mask()->bounds();
+            m_selX = bounds.x;
+            m_selY = bounds.y;
+            m_selW = bounds.w;
+            m_selH = bounds.h;
+            hasSelection = true;
+        } else {
+            // Reset to defaults if no selection
+            m_selX = -1;
+            m_selY = -1;
+            m_selW = 999999;
+            m_selH = 999999;
+        }
     }
+    
     std::string sizeHint = (w > 0 && h > 0) ? "CANVAS SIZE: " + std::to_string(w) + "x" + std::to_string(h) + " pixels. " : "";
+    std::string selectionHint = hasSelection ? 
+        "ACTIVE SELECTION: x=" + std::to_string(selX) + ", y=" + std::to_string(selY) + 
+        ", width=" + std::to_string(selW) + ", height=" + std::to_string(selH) + 
+        ". ONLY draw within this area! " : 
+        "";
     
     // Generate palette table
     std::string paletteTable = generatePaletteTable();
 
     // Build optimized prompt
-    std::string systemPrompt = "Context: You are Aseprite Assistant. Use Lua to script Aseprite.\n\n" + sizeHint + "\n\n"
-        "CRITICAL LAYER SAFETY: Always start by creating a new layer:\n"
+    std::string systemPrompt = "Context: You are Aseprite Assistant. Use Lua to script Aseprite.\n\n" + sizeHint + selectionHint + "\n\n"
+        "CRITICAL LAYER SAFETY: Always start by creating a new layer AND cel:\n"
         "```lua\n"
-        "local layer = app.activeSprite:newLayer()\n"
+        "local sprite = app.activeSprite\n"
+        "local layer = sprite:newLayer()\n"
         "layer.name = 'AI Generation'\n"
         "app.activeLayer = layer\n"
+        "-- CRITICAL: Create a cel (image) in this layer\n"
+        "local cel = sprite:newCel(layer, app.activeFrame)\n"
         "```\n\n"
         "OPTIMIZED DRAWING METHOD - You have a helper function for efficient drawing:\n"
         "```lua\n"
@@ -536,18 +646,26 @@ private:
            std::string providerInfo = m_usedProvider.empty() ? "" : " (via " + m_usedProvider + ")";
            if(m_statusLabel) m_statusLabel->setText("System: Executing script..." + providerInfo);
            
-           // Inject palette helper
+           // Inject palette helper with selection support
            std::string paletteTable = generatePaletteTable();
            std::string helperCode = 
-               "-- Helper function for efficient pixel drawing\n"
-               "function drawHexGrid(startX, startY, width, hexString, palette)\n"
+               "function drawHexGrid(startX, startY, width, hexString, palette, selX, selY, selW, selH)\n"
                "    local x = 0\n"
                "    local y = 0\n"
+               "    selX = selX or -1\n"
+               "    selY = selY or -1\n"
+               "    selW = selW or 999999\n"
+               "    selH = selH or 999999\n"
                "    for i = 1, #hexString do\n"
                "        local char = hexString:sub(i, i)\n"
                "        local colorIndex = tonumber(char, 16)\n"
                "        if colorIndex and palette[colorIndex] then\n"
-               "            app.activeImage:drawPixel(startX + x, startY + y, palette[colorIndex])\n"
+               "            local px = startX + x\n"
+               "            local py = startY + y\n"
+               "            -- Check if pixel is within selection bounds\n"
+               "            if selX == -1 or (px >= selX and px < selX + selW and py >= selY and py < selY + selH) then\n"
+               "                app.activeImage:drawPixel(px, py, palette[colorIndex])\n"
+               "            end\n"
                "        end\n"
                "        x = x + 1\n"
                "        if x >= width then\n"
@@ -557,10 +675,19 @@ private:
                "    end\n"
                "end\n\n"
                "-- Current palette\n"
-               "local palette = " + paletteTable + "\n\n";
+               "local palette = " + paletteTable + "\n\n"
+               "-- Selection bounds (if any)\n" +
+               "local selX, selY, selW, selH = " + std::to_string(m_selX) + ", " + std::to_string(m_selY) + ", " + std::to_string(m_selW) + ", " + std::to_string(m_selH) + "\n\n";
+           
+           // Wrap everything in a transaction for atomic undo/redo
+           std::string finalLua = 
+               "app.transaction(function()\\n" +
+               helperCode + 
+               luaCode + 
+               "\\nend)";
            
            app::script::Engine engine;
-           engine.evalCode(helperCode + luaCode);
+           engine.evalCode(finalLua);
            if(m_statusLabel) m_statusLabel->setText("System: Done!" + providerInfo);
         } else {
            if(m_statusLabel) m_statusLabel->setText("System: No code found.");
