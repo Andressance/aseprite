@@ -26,6 +26,7 @@
 #include <sstream>
 
 #include <cstdlib>
+#include <future>
 
 std::string get_gemini_key() {
   if (const char* env_p = std::getenv("GEMINI_API_KEY")) {
@@ -117,6 +118,12 @@ public:
     m_view->setExpansive(true); // Fill available space
     mainBox->addChild(m_view);
 
+    // Preview area
+    Box* previewBox = new Box(HORIZONTAL);
+    m_previewLabel = new Label("Ready to capture...");
+    previewBox->addChild(m_previewLabel);
+    mainBox->addChild(previewBox);
+    
     // Input Area
     Box* inputBox = new Box(HORIZONTAL);
     m_input = new Entry(1024, "");
@@ -142,8 +149,16 @@ public:
   }
   
   ~GeminiChatWindow() {
-      if (m_worker.joinable())
-          m_worker.join();
+      m_abort = true;  // Signal worker to abort
+      if (m_worker.joinable()) {
+          // Give it a moment to finish, then detach if still running
+          auto future = std::async(std::launch::async, [this]{ 
+              if (m_worker.joinable()) m_worker.join(); 
+          });
+          if (future.wait_for(std::chrono::milliseconds(500)) == std::future_status::timeout) {
+              m_worker.detach();  // Prevent UI freeze
+          }
+      }
       delete m_timer;
   }
 
@@ -157,10 +172,12 @@ private:
   
   std::thread m_worker;
   std::atomic<bool> m_done;
+  std::atomic<bool> m_abort{false};
   std::string m_response;
   std::string m_error;
   
   ui::Label* m_statusLabel = nullptr;
+  Label* m_previewLabel = nullptr;
 
   ui::Label* addMessage(const std::string& role, const std::string& text) {
       ui::Box* row = new ui::Box(HORIZONTAL);
@@ -191,6 +208,14 @@ private:
          m_input->setEnabled(true);
          m_send->setEnabled(true);
          return;
+     }
+     
+     // Update preview
+     Doc* doc = m_context->activeDocument();
+     if (doc && doc->sprite() && m_previewLabel) {
+         int w = doc->sprite()->width();
+         int h = doc->sprite()->height();
+         m_previewLabel->setText("Captured: " + std::to_string(w) + "x" + std::to_string(h));
      }
 
      m_done = false;
@@ -240,25 +265,82 @@ private:
     std::vector<unsigned char> buffer(std::istreambuf_iterator<char>(fs), {});
     return base64_encode(buffer.data(), buffer.size());
   }
+  
+  std::string generatePaletteTable() {
+    std::stringstream ss;
+    Doc* doc = m_context->activeDocument();
+    if (!doc || !doc->sprite()) return "{}";
+    
+    doc::Palette* palette = doc->sprite()->palette(doc->sprite()->frame(0));
+    ss << "{";
+    for (int i = 0; i < palette->size() && i < 16; i++) {
+        doc::color_t c = palette->getEntry(i);
+        int r = doc::rgba_getr(c);
+        int g = doc::rgba_getg(c);
+        int b = doc::rgba_getb(c);
+        int a = doc::rgba_geta(c);
+        ss << "[" << i << "]=Color{r=" << r << ",g=" << g << ",b=" << b << ",a=" << a << "},";
+    }
+    ss << "}";
+    return ss.str();
+  }
 
   void processRequestWorker(std::string userPrompt, std::string imgBase64) {
+    if (m_abort) return;  // Check abort flag
+    
     int w = 0, h = 0;
     if (m_context && m_context->activeDocument() && m_context->activeDocument()->sprite()) {
         w = m_context->activeDocument()->sprite()->width();
         h = m_context->activeDocument()->sprite()->height();
     }
     std::string sizeHint = (w > 0 && h > 0) ? "CANVAS SIZE: " + std::to_string(w) + "x" + std::to_string(h) + " pixels. " : "";
+    
+    // Generate palette table
+    std::string paletteTable = generatePaletteTable();
+
+    // Build optimized prompt with hex grid support
+    std::string systemPrompt = "Context: You are Aseprite Assistant. Use Lua to script Aseprite.\n\n" + sizeHint + "\n\n"
+        "CRITICAL LAYER SAFETY: Always start by creating a new layer:\n"
+        "```lua\n"
+        "local layer = app.activeSprite:newLayer()\n"
+        "layer.name = 'AI Generation'\n"
+        "app.activeLayer = layer\n"
+        "```\n\n"
+        "OPTIMIZED DRAWING METHOD - You have a helper function for efficient drawing:\n"
+        "```lua\n"
+        "-- drawHexGrid(startX, startY, width, hexString, palette)\n"
+        "-- hexString: each character (0-F) is a palette index\n"
+        "-- Example: \"0001112000011120\" draws a 4x4 grid\n"
+        "```\n\n"
+        "CURRENT PALETTE (use ONLY these indices 0-F):\n" + paletteTable + "\n\n"
+        "AVAILABLE METHODS:\n"
+        "1. PREFERRED: Use drawHexGrid() for efficient pixel-perfect drawing\n"
+        "   - Generate a hex string where each char is a palette index\n"
+        "   - Example: drawHexGrid(0, 0, 8, \"00112233...\", palette)\n"
+        "2. FALLBACK: Use app.activeImage:drawPixel(x, y, palette[index]) ONLY if needed\n"
+        "   - Always use palette[index], NEVER Color{r=...,g=...,b=...}\n"
+        "3. ANIMATION: Create frames with sprite:newFrame() or sprite:newEmptyFrame()\n\n"
+        "STYLE REQUIREMENTS:\n"
+        "- Create PROFESSIONAL, HIGH-QUALITY pixel art\n"
+        "- Use shading and lighting for depth (not flat colors)\n"
+        "- Maintain coherent color palette usage\n"
+        "- Ensure proper proportions for pixel art\n"
+        "- NO stray pixels or noise\n\n"
+        "ALWAYS end with `app.refresh()`\n\n"
+        "User Request: " + userPrompt + "\n\nOutput MUST be a complete Lua code block in markdown format.";
 
     json11::Json reqBody = json11::Json::object {
       { "contents", json11::Json::array {
         json11::Json::object {
           { "parts", json11::Json::array {
-             json11::Json::object { { "text", "Context: You are Aseprite Assistant. Use Lua to script Aseprite.\n\n" + sizeHint + "\n\nAPI REFERENCE:\n1. DRAWING: Use `app.activeImage:drawPixel(x, y, Color{r=255,g=0,b=0,a=255})`. Iterate x,y manually. DO NOT use algorithms that require reading pixels unless necessary.\n2. ANIMATION: If the user asks for animation, YOU MUST CREATE FRAMES.\n   - `app.activeSprite:newFrame()` duplicates the current frame.\n   - `app.activeSprite:newEmptyFrame()` creates a blank frame.\n   - `app.activeFrame = frame` switches focus.\n\n   Example (4 Frame Animation):\n   ```lua\n   local sprite = app.activeSprite\n   for i=1,4 do\n     local frame = sprite:newFrame()\n     app.activeFrame = frame\n     local img = app.activeImage\n     -- Draw modification for this frame\n   end\n   ```\n3. STYLE: Create PROFESSIONAL, HIGH-QUALITY pixel art with depth and shading.\n   - Use a coherent color palette.\n   - Use shading/lighting to define shapes (do not just draw flat blobs).\n   - If drawing a character, ensure proper proportions for the canvas size.\n   - Avoid noise or stray pixels.\n4. DO NOT use `app.useTool`.\n5. ALWAYS end with `app.refresh()`.\n\nUser Request: " + userPrompt + "\nOutput MUST be a Markdown Lua code block." } },
+             json11::Json::object { { "text", systemPrompt } },
              json11::Json::object { { "inline_data", json11::Json::object { { "mime_type", "image/png" }, { "data", imgBase64 } } } }
           }}
         }
       }}
     };
+    
+    if (m_abort) return;  // Check abort flag before API call
     
     std::string bodyFunc = reqBody.dump();
     
@@ -279,12 +361,15 @@ private:
     std::stringstream ss;
     net::HttpResponse resp(&ss);
     
+    if (m_abort) return;  // Check abort flag
+    
     if (req.send(resp)) {
-       m_response = ss.str();
+       if (!m_abort) m_response = ss.str();
     } else {
-       m_error = "Network Error";
+       if (!m_abort) m_error = "Network Error";
     }
-    m_done = true;
+    
+    if (!m_abort) m_done = true;
   }
   
   void handleResponse(const std::string& jsonStr) {
@@ -308,34 +393,58 @@ private:
        std::string text = json["candidates"][0]["content"]["parts"][0]["text"].string_value();
        
        // Lua Extraction
-       std::string luaCode;
-       size_t start = text.find("```lua");
-       if (start != std::string::npos) {
-          start += 6;
-          size_t end = text.find("```", start);
-          if (end != std::string::npos) {
-             luaCode = text.substr(start, end - start);
-          }
-       } else {
-             start = text.find("```");
-             if (start != std::string::npos) {
-                start += 3;
-                size_t end = text.find("```", start);
-                if (end != std::string::npos) {
-                  luaCode = text.substr(start, end - start);
-                }
-             }
-       }
-       
-       if (!luaCode.empty()) {
-          if(m_statusLabel) m_statusLabel->setText("System: Executing script...");
-          app::script::Engine engine;
-          engine.evalCode(luaCode);
-          if(m_statusLabel) m_statusLabel->setText("System: Done.");
-       } else {
-          if(m_statusLabel) m_statusLabel->setText("System: No code found.");
-          addMessage("Gemini", text.substr(0, 100) + "..."); // Preview
-       }
+        std::string luaCode;
+        size_t start = text.find("```lua");
+        if (start != std::string::npos) {
+           start += 6;
+           size_t end = text.find("```", start);
+           if (end != std::string::npos) {
+              luaCode = text.substr(start, end - start);
+           }
+        } else {
+              start = text.find("```");
+              if (start != std::string::npos) {
+                 start += 3;
+                 size_t end = text.find("```", start);
+                 if (end != std::string::npos) {
+                   luaCode = text.substr(start, end - start);
+                 }
+              }
+        }
+        
+        if (!luaCode.empty()) {
+           if(m_statusLabel) m_statusLabel->setText("System: Executing script...");
+           
+           // Inject palette helper
+           std::string paletteTable = generatePaletteTable();
+           std::string helperCode = 
+               "-- Helper function for efficient pixel drawing\n"
+               "function drawHexGrid(startX, startY, width, hexString, palette)\n"
+               "    local x = 0\n"
+               "    local y = 0\n"
+               "    for i = 1, #hexString do\n"
+               "        local char = hexString:sub(i, i)\n"
+               "        local colorIndex = tonumber(char, 16)\n"
+               "        if colorIndex and palette[colorIndex] then\n"
+               "            app.activeImage:drawPixel(startX + x, startY + y, palette[colorIndex])\n"
+               "        end\n"
+               "        x = x + 1\n"
+               "        if x >= width then\n"
+               "            x = 0\n"
+               "            y = y + 1\n"
+               "        end\n"
+               "    end\n"
+               "end\n\n"
+               "-- Current palette\n"
+               "local palette = " + paletteTable + "\n\n";
+           
+           app::script::Engine engine;
+           engine.evalCode(helperCode + luaCode);
+           if(m_statusLabel) m_statusLabel->setText("System: Done.");
+        } else {
+           if(m_statusLabel) m_statusLabel->setText("System: No code found.");
+           addMessage("Gemini", text.substr(0, 100) + "..."); // Preview
+        }
   }
 };
 
